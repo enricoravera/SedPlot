@@ -6,13 +6,14 @@ spectrometer parameters, and hydration layer integrity based on real-world
 experimental sample preparation weights and volumes.
 """
 
-import math
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
-
-# Physical and Thermodynamic Constants
-Rb = 8.31
+from rm_cp_physics import (
+    N_A, k_B, Rb, EINSTEIN_COEFF, D_CH_RIGID, D_HH_RIGID,
+    water_viscosity, perrin_shape_factors,
+    compute_cp_efficiency_vec, ross_minton_tau_c, derive_hydrodynamics,
+)
 
 # PHI_M: maximum (random close) packing volume fraction in the Ross-Minton
 # crowding model — the point at which the hydrated protein "jams" and
@@ -23,135 +24,6 @@ Rb = 8.31
 # size polydispersity, so it's exposed as a slider (default 0.64) rather
 # than hardcoded.
 PHI_M_DEFAULT = 0.64
-
-# EINSTEIN_COEFF: the Einstein intrinsic-viscosity coefficient for dilute
-# hard spheres. Together with PHI_M it sets how steeply tau_c (and hence CP
-# efficiency) blows up as concentration approaches the jamming limit:
-# ln(eta_rel) = EINSTEIN_COEFF * v_eff * c / (1 - c/cl0).
-EINSTEIN_COEFF = 2.5
-
-def perrin_shape_factors(p):
-    """Perrin translational frictional ratio F_T, and HullRad's empirical
-    rotational shape factor F_R = F_T**4, for a prolate (p>1) or oblate
-    (p<1) ellipsoid of revolution of axial ratio p = a/b, relative to a
-    sphere of equal volume. Returns (1.0, 1.0) for p == 1 (sphere). A single
-    number, no coordinates needed -- this is the classic Perrin (1936)
-    whole-body approximation, also used for "equivalent ellipsoid" fits of
-    dumbbell/elongated multi-domain assemblies. Verified against tabulated
-    frictional ratios (F_T ~ 1.044 at p=2, ~1.25 at p=5, ~1.54 at p=10):
-        prolate: F_T = sqrt(p^2-1) / (p^(1/3) * ln(p + sqrt(p^2-1)))
-        oblate:  F_T = sqrt(1-p^2) / (p^(1/3) * arctan(sqrt(1-p^2)/p))
-    F_R = F_T**4 stands in for the full Perrin rotational tensor (HullRad,
-    Fleming & Fleming 2018), valid well beyond axial ratios typically seen
-    for folded proteins.
-    """
-    if abs(p - 1.0) < 1e-6:
-        return 1.0, 1.0
-    if p > 1.0:
-        F_T = math.sqrt(p**2 - 1.0) / (p**(1.0/3.0) * math.log(p + math.sqrt(p**2 - 1.0)))
-    else:
-        F_T = math.sqrt(1.0 - p**2) / (p**(1.0/3.0) * math.atan(math.sqrt(1.0 - p**2) / p))
-    return F_T, F_T**4
-
-# D_CH_RIGID / D_HH_RIGID: static (rigid-lattice) one-bond 1H-13C
-# heteronuclear, and effective 1H-1H homonuclear, dipolar coupling
-# constants (angular frequency, rad/s). D_CH_RIGID is the standard
-# ~1.09 A C-H bond-length value (~23 kHz/2pi) quoted throughout the CPMAS
-# literature. D_HH_RIGID is a representative root-second-moment proton-
-# proton coupling for a densely protonated, fully rigid solid (~30-50 kHz
-# FWHM proton linewidths are typical; 40 kHz used here as a round default).
-# These feed a MAS- and tau_c-INDEPENDENT "solid-like" CP channel (see
-# compute_cp_efficiency_vec): in a truly rigid lattice the heteronuclear
-# coupling is not motionally averaged at all, and it is the homonuclear
-# (not the tumbling) fluctuation that lets cross-polarisation proceed, even
-# exactly on the n=0 Hartmann-Hahn condition. Kept as fixed constants
-# (not sliders) since they describe generic CH/HH bond physics rather than
-# a per-sample preparation choice.
-D_CH_RIGID = 2 * np.pi * 23.0e3
-D_HH_RIGID = 2 * np.pi * 40.0e3
-
-N_A = 6.02214076e23             
-k_B = 1.380649e-23              
-
-def water_viscosity(T):
-    """Calculates water viscosity as a function of Temperature (K)"""
-    return 2.414e-5 * (10 ** (247.8 / (T - 140.0)))
-
-def compute_cp_efficiency_vec(tau_c, omega_R, omega_0_H, omega_0_C, omega_1_H, omega_1_C, b, S, tau_s, tau_CP):
-    """Vectorized calculation of local CP efficiency ratio (I_CP/I_DP)"""
-    gamma_H = 267.513e6
-    gamma_C = 67.262e6
-    b_tesla = b * 1e-3
-    w_R = 2 * np.pi * omega_R
-    w_0_H = 2 * np.pi * omega_0_H
-    w_1_H = 2 * np.pi * omega_1_H
-    w_1_C = 2 * np.pi * omega_1_C
-    
-    def j_0(w):
-        term1 = (1 - S**2) * (2 * tau_c) / (1 + (w * tau_c)**2)
-        term2 = S**2 * (2 * tau_s) / (1 + (w * tau_s)**2)
-        return term1 + term2
-
-    # Rigid-lattice spectral density: same Lorentzian form as j_0, but the
-    # fluctuation that broadens it is the homonuclear (1H-1H) dipolar
-    # network (tau_HH = 1/D_HH_RIGID), not molecular tumbling. Unlike j_0,
-    # this does NOT vanish as tau_c -> infinity, which is the "solid-like"
-    # behaviour a fully jammed/rigid particle should show.
-    tau_HH = 1.0 / D_HH_RIGID
-    def j_0_rigid(w):
-        return (2 * tau_HH) / (1 + (w * tau_HH)**2)
-
-    def sidebands(j0_func, w):
-        return (1/3) * (j0_func(w - w_R) + j0_func(w + w_R)) + (1/6) * (j0_func(w - 2*w_R) + j0_func(w + 2*w_R))
-
-    def j(w):
-        return sidebands(j_0, w)
-
-    def j_rigid(w):
-        return sidebands(j_0_rigid, w)
-
-    R_1rho_H = ((gamma_H * b_tesla)**2 / 2.0) * (j(w_1_H) + j(w_0_H))
-
-    # Heteronuclear CP rate = mobile (motionally-averaged) channel + rigid
-    # (solid-like) channel. R_CH_mobile dominates while the particle still
-    # tumbles fast enough for the BWR/motional-narrowing treatment to hold;
-    # R_CH_rigid takes over once tau_c grows long enough that the mobile
-    # channel's spectral density has collapsed. Both carry the same
-    # first/second-order MAS-sideband weighting, which is what lets the
-    # rigid channel remain MAS-frequency dependent even though it sits
-    # exactly on the n=0 (MAS-independent) Hartmann-Hahn condition.
-    R_CH_mobile = ((gamma_C * b_tesla)**2 / 2.0) * j(w_1_H - w_1_C)
-    # Motional-narrowing gate: the static D_CH_RIGID coupling is only
-    # "seen" once tumbling is slow enough that it is no longer averaged
-    # away. Uses an exponential (Arrhenius/mollifier-type) onset rather
-    # than a power law: f_rigid ~ exp(-1/x) vanishes to ALL polynomial
-    # orders as x=D_CH_RIGID*tau_c -> 0, suppressing fast-tumbling/dilute
-    # leakage much more strongly than a x^2/(1+x^2) gate, while still
-    # saturating to 1 once tau_c grows past the 1/D_CH_RIGID threshold,
-    # and with a gentler slope right at its half-max point.
-    with np.errstate(divide='ignore', over='ignore'):
-        f_rigid = np.where(tau_c > 0, np.exp(-1.0 / (D_CH_RIGID * tau_c)), 0.0)
-    R_CH_rigid = f_rigid * (D_CH_RIGID**2 / 2.0) * j_rigid(w_1_H - w_1_C)
-    R_CH = R_CH_mobile + R_CH_rigid
-    
-    with np.errstate(divide='ignore'):
-        T_1rho_H = np.where(R_1rho_H > 0, 1.0 / R_1rho_H, np.inf)
-        T_CH = np.where(R_CH > 0, 1.0 / R_CH, np.inf)
-        
-    efficiency_term = np.zeros_like(T_CH)
-    inf_mask = np.isinf(T_1rho_H)
-    close_mask = np.isclose(T_CH, T_1rho_H) & ~inf_mask
-    normal_mask = ~inf_mask & ~close_mask
-    
-    if np.any(close_mask):
-        efficiency_term[close_mask] = (tau_CP / T_1rho_H[close_mask]) * np.exp(-tau_CP / T_1rho_H[close_mask])
-    if np.any(normal_mask):
-        t1, tch = T_1rho_H[normal_mask], T_CH[normal_mask]
-        ratio = tch / t1
-        efficiency_term[normal_mask] = (np.exp(-tau_CP / t1) - np.exp(-tau_CP / tch)) / (1.0 - ratio)
-        
-    return (gamma_H / gamma_C) * efficiency_term
-
 
 class HydrationCPOptimizer:
     def __init__(self):
@@ -294,7 +166,6 @@ class HydrationCPOptimizer:
         phi_m = self.sliders['sphi'].val
         cavity_vol = self.sliders['scav'].val
         p_axial = self.sliders['saxial'].val
-        F_T, F_R = perrin_shape_factors(p_axial)
         delta_smooth = self.sliders['sdsmooth'].val
         b = self.sliders['sb'].val
         S = self.sliders['sS'].val
@@ -315,10 +186,7 @@ class HydrationCPOptimizer:
         v_eff = v_bar + delta_hyd_nominal + cavity_vol
         cl0 = (phi_m / v_eff) * 1000.0   # Mechanical Jamming Limit (mg/mL)
         
-        M_mol = mw * 1000.0                     
-        eta0 = water_viscosity(temp)               
-        V_h = M_mol * v_eff * 1e-6 / N_A * F_R
-        tau_c0 = eta0 * V_h / (k_B * temp)
+        tau_c0, F_T, F_R = derive_hydrodynamics(mw, temp, v_eff, p_axial)
 
         # 4. Evaluate concentration-dependent viscosity crowding and CP efficiency matrix
         # Ross-Minton: ln(eta_rel) = EINSTEIN_COEFF * v_eff * c / (1 - c/cl0); rewritten in
@@ -331,8 +199,8 @@ class HydrationCPOptimizer:
         # now a slider rather than a fixed constant. F_T folded in as a simple Simha-type
         # proxy: non-spherical particles raise viscosity faster per unit packing fraction.
         c_ratio = np.clip(self.c_space / cl0, 0, 0.99)
-        exponent = np.clip(EINSTEIN_COEFF * F_T * phi_m * c_ratio / (1.0 - c_ratio + delta_smooth), 0, 50)
-        tau_c_space = np.clip(tau_c0 * np.exp(exponent), 0, 1e6)
+        einstein_coeff_eff = EINSTEIN_COEFF * F_T * phi_m
+        tau_c_space = ross_minton_tau_c(c_ratio, tau_c0, einstein_coeff_eff, phi_m, delta_smooth)
         
         w1C_hz = w1H - n_match * w_R
         cp_eff_space = compute_cp_efficiency_vec(
